@@ -9,6 +9,17 @@ import (
 	"github.com/opencontainers/runc/libcontainer/selinux"
 )
 
+// Valid Label Options
+var validOptions = map[string]bool{
+	"disable": true,
+	"type":    true,
+	"user":    true,
+	"role":    true,
+	"level":   true,
+}
+
+var ErrIncompatibleLabel = fmt.Errorf("Bad SELinux option z and Z can not be used together")
+
 // InitLabels returns the process label and file labels to be used within
 // the container.  A list of options can be passed into this function to alter
 // the labels.  The labels returned will include a random MCS String, that is
@@ -26,9 +37,13 @@ func InitLabels(options []string) (string, string, error) {
 				return "", "", nil
 			}
 			if i := strings.Index(opt, ":"); i == -1 {
-				return "", "", fmt.Errorf("Bad SELinux Option")
+				return "", "", fmt.Errorf("Bad label option %q, valid options 'disable' or \n'user, role, level, type' followed by ':' and a value", opt)
 			}
 			con := strings.SplitN(opt, ":", 2)
+			if !validOptions[con[0]] {
+				return "", "", fmt.Errorf("Bad label option %q, valid options 'disable, user, role, level, type'", con[0])
+
+			}
 			pcon[con[0]] = con[1]
 			if con[0] == "level" || con[0] == "user" {
 				mcon[con[0]] = con[1]
@@ -79,6 +94,11 @@ func GetProcessLabel() (string, error) {
 	return selinux.Getexeccon()
 }
 
+// GetFileLabel returns the label for specified path
+func GetFileLabel(path string) (string, error) {
+	return selinux.Getfilecon(path)
+}
+
 // SetFileLabel modifies the "path" label to the specified file label
 func SetFileLabel(path string, fileLabel string) error {
 	if selinux.SelinuxEnabled() && fileLabel != "" {
@@ -87,7 +107,7 @@ func SetFileLabel(path string, fileLabel string) error {
 	return nil
 }
 
-// Tell the kernel the label for all files to be created
+// SetFileCreateLabel tells the kernel the label for all files to be created
 func SetFileCreateLabel(fileLabel string) error {
 	if selinux.SelinuxEnabled() {
 		return selinux.Setfscreatecon(fileLabel)
@@ -95,28 +115,24 @@ func SetFileCreateLabel(fileLabel string) error {
 	return nil
 }
 
-// Change the label of path to the filelabel string.  If the relabel string
-// is "z", relabel will change the MCS label to s0.  This will allow all
-// containers to share the content.  If the relabel string is a "Z" then
-// the MCS label should continue to be used.  SELinux will use this field
-// to make sure the content can not be shared by other containes.
-func Relabel(path string, fileLabel string, relabel string) error {
-	exclude_path := []string{"/", "/usr", "/etc"}
+// Relabel changes the label of path to the filelabel string.
+// It changes the MCS label to s0 if shared is true.
+// This will allow all containers to share the content.
+func Relabel(path string, fileLabel string, shared bool) error {
+	if !selinux.SelinuxEnabled() {
+		return nil
+	}
+
 	if fileLabel == "" {
 		return nil
 	}
-	if !strings.ContainsAny(relabel, "zZ") {
-		return nil
+
+	exclude_paths := map[string]bool{"/": true, "/usr": true, "/etc": true}
+	if exclude_paths[path] {
+		return fmt.Errorf("Relabeling of %s is not allowed", path)
 	}
-	for _, p := range exclude_path {
-		if path == p {
-			return fmt.Errorf("Relabeling of %s is not allowed", path)
-		}
-	}
-	if strings.Contains(relabel, "z") && strings.Contains(relabel, "Z") {
-		return fmt.Errorf("Bad SELinux option z and Z can not be used together")
-	}
-	if strings.Contains(relabel, "z") {
+
+	if shared {
 		c := selinux.NewContext(fileLabel)
 		c["level"] = "s0"
 		fileLabel = c.Get()
@@ -160,4 +176,22 @@ func DupSecOpt(src string) []string {
 // support for future container processes
 func DisableSecOpt() []string {
 	return selinux.DisableSecOpt()
+}
+
+// Validate checks that the label does not include unexpected options
+func Validate(label string) error {
+	if strings.Contains(label, "z") && strings.Contains(label, "Z") {
+		return ErrIncompatibleLabel
+	}
+	return nil
+}
+
+// RelabelNeeded checks whether the user requested a relabel
+func RelabelNeeded(label string) bool {
+	return strings.Contains(label, "z") || strings.Contains(label, "Z")
+}
+
+// IsShared checks that the label includes a "shared" mark
+func IsShared(label string) bool {
+	return strings.Contains(label, "z")
 }
