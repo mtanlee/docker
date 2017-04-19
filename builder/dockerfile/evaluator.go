@@ -25,6 +25,8 @@ import (
 
 	"github.com/docker/docker/builder/dockerfile/command"
 	"github.com/docker/docker/builder/dockerfile/parser"
+	"github.com/docker/docker/runconfig/opts"
+	"github.com/pkg/errors"
 )
 
 // Environment variable interpolation will happen on these statements only.
@@ -115,7 +117,7 @@ func (b *Builder) dispatch(stepN int, stepTotal int, ast *parser.Node) error {
 
 	if cmd == "onbuild" {
 		if ast.Next == nil {
-			return fmt.Errorf("ONBUILD requires at least one argument")
+			return errors.New("ONBUILD requires at least one argument")
 		}
 		ast = ast.Next.Children[0]
 		strList = append(strList, ast.Value)
@@ -127,65 +129,18 @@ func (b *Builder) dispatch(stepN int, stepTotal int, ast *parser.Node) error {
 
 	}
 
-	// count the number of nodes that we are going to traverse first
-	// so we can pre-create the argument and message array. This speeds up the
-	// allocation of those list a lot when they have a lot of arguments
-	cursor := ast
-	var n int
-	for cursor.Next != nil {
-		cursor = cursor.Next
-		n++
-	}
-	msgList := make([]string, n)
+	msgList := initMsgList(ast)
+	// Append build args to runConfig environment variables
+	envs := append(b.runConfig.Env, b.buildArgsWithoutConfigEnv()...)
 
-	var i int
-	// Append the build-time args to config-environment.
-	// This allows builder config to override the variables, making the behavior similar to
-	// a shell script i.e. `ENV foo bar` overrides value of `foo` passed in build
-	// context. But `ENV foo $foo` will use the value from build context if one
-	// isn't already been defined by a previous ENV primitive.
-	// Note, we get this behavior because we know that ProcessWord() will
-	// stop on the first occurrence of a variable name and not notice
-	// a subsequent one. So, putting the buildArgs list after the Config.Env
-	// list, in 'envs', is safe.
-	envs := b.runConfig.Env
-	for key, val := range b.options.BuildArgs {
-		if !b.isBuildArgAllowed(key) {
-			// skip build-args that are not in allowed list, meaning they have
-			// not been defined by an "ARG" Dockerfile command yet.
-			// This is an error condition but only if there is no "ARG" in the entire
-			// Dockerfile, so we'll generate any necessary errors after we parsed
-			// the entire file (see 'leftoverArgs' processing in evaluator.go )
-			continue
-		}
-		envs = append(envs, fmt.Sprintf("%s=%s", key, val))
-	}
-	for ast.Next != nil {
+	for i := 0; ast.Next != nil; i++ {
 		ast = ast.Next
-		var str string
-		str = ast.Value
-		if replaceEnvAllowed[cmd] {
-			var err error
-			var words []string
-
-			if allowWordExpansion[cmd] {
-				words, err = ProcessWords(str, envs)
-				if err != nil {
-					return err
-				}
-				strList = append(strList, words...)
-			} else {
-				str, err = ProcessWord(str, envs)
-				if err != nil {
-					return err
-				}
-				strList = append(strList, str)
-			}
-		} else {
-			strList = append(strList, str)
+		words, err := b.evaluateEnv(cmd, ast.Value, envs)
+		if err != nil {
+			return err
 		}
+		strList = append(strList, words...)
 		msgList[i] = ast.Value
-		i++
 	}
 
 	msg += " " + strings.Join(msgList, " ")
@@ -200,4 +155,78 @@ func (b *Builder) dispatch(stepN int, stepTotal int, ast *parser.Node) error {
 	}
 
 	return fmt.Errorf("Unknown instruction: %s", upperCasedCmd)
+}
+
+// count the number of nodes that we are going to traverse first
+// allocation of those list a lot when they have a lot of arguments
+func initMsgList(cursor *parser.Node) []string {
+	var n int
+	for ; cursor.Next != nil; n++ {
+		cursor = cursor.Next
+	}
+	return make([]string, n)
+}
+
+func (b *Builder) evaluateEnv(cmd string, str string, envs []string) ([]string, error) {
+	if !replaceEnvAllowed[cmd] {
+		return []string{str}, nil
+	}
+	var processFunc func(string, []string, rune) ([]string, error)
+	if allowWordExpansion[cmd] {
+		processFunc = ProcessWords
+	} else {
+		processFunc = func(word string, envs []string, escape rune) ([]string, error) {
+			word, err := ProcessWord(word, envs, escape)
+			return []string{word}, err
+		}
+	}
+	return processFunc(str, envs, b.escapeToken)
+}
+
+// buildArgsWithoutConfigEnv returns a list of key=value pairs for all the build
+// args that are not overriden by runConfig environment variables.
+func (b *Builder) buildArgsWithoutConfigEnv() []string {
+	envs := []string{}
+	configEnv := b.runConfigEnvMapping()
+
+	for key, val := range b.buildArgs.GetAllAllowed() {
+		if _, ok := configEnv[key]; !ok {
+			envs = append(envs, fmt.Sprintf("%s=%s", key, val))
+		}
+	}
+	return envs
+}
+
+func (b *Builder) runConfigEnvMapping() map[string]string {
+	return opts.ConvertKVStringsToMap(b.runConfig.Env)
+}
+
+// checkDispatch does a simple check for syntax errors of the Dockerfile.
+// Because some of the instructions can only be validated through runtime,
+// arg, env, etc., this syntax check will not be complete and could not replace
+// the runtime check. Instead, this function is only a helper that allows
+// user to find out the obvious error in Dockerfile earlier on.
+func checkDispatch(ast *parser.Node) error {
+	cmd := ast.Value
+	upperCasedCmd := strings.ToUpper(cmd)
+
+	// To ensure the user is given a decent error message if the platform
+	// on which the daemon is running does not support a builder command.
+	if err := platformSupports(strings.ToLower(cmd)); err != nil {
+		return err
+	}
+
+	// The instruction itself is ONBUILD, we will make sure it follows with at
+	// least one argument
+	if upperCasedCmd == "ONBUILD" {
+		if ast.Next == nil {
+			return errors.New("ONBUILD requires at least one argument")
+		}
+	}
+
+	if _, ok := evaluateTable[cmd]; ok {
+		return nil
+	}
+
+	return errors.Errorf("unknown instruction: %s", upperCasedCmd)
 }
